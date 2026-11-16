@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: 'Optional direct URL to the source ZIP (if not using repo contents)'
+        description: 'Optional direct URL to the source ZIP'
         required: false
         default: ''
 
@@ -26,35 +26,87 @@ jobs:
           java-version: '8'
           distribution: 'temurin'
 
-      - name: Download and extract source ZIP (if provided)
+      - name: Download source ZIP from URL (if provided)
         if: ${{ github.event.inputs.zip_url != '' }}
         run: |
-          mkdir -p alexfriend-src
+          echo "Downloading from provided URL..."
           curl -L -o alexfriend-src.zip "${{ github.event.inputs.zip_url }}"
-          unzip -o alexfriend-src.zip -d alexfriend-src
-          # If the ZIP contains a single top-level folder, move contents up
-          if [ $(ls alexfriend-src | wc -l) -eq 1 ]; then
-            TOP=$(ls alexfriend-src)
-            mv alexfriend-src/$TOP/* alexfriend-src/ 2>/dev/null || true
-            rmdir alexfriend-src/$TOP 2>/dev/null || true
-          fi
-          echo "Extracted source from ZIP"
-          ls -la alexfriend-src
+          ls -lh alexfriend-src.zip
 
-      - name: Locate project root
+      - name: Locate and extract source ZIP
+        id: extract
+        run: |
+          set -e
+          echo "=== Looking for source ZIP ==="
+          ls -la
+
+          ZIP=""
+          # Prefer exact name the user mentioned
+          if [ -f "alexfriend-src.zip" ]; then
+            ZIP="alexfriend-src.zip"
+          elif [ -f "alexfriend-mod-1.12.2-src.zip" ]; then
+            ZIP="alexfriend-mod-1.12.2-src.zip"
+          else
+            # Fallback: any zip in root
+            ZIP=$(ls *.zip 2>/dev/null | head -1 || true)
+          fi
+
+          if [ -z "$ZIP" ]; then
+            echo "No ZIP found in repository root."
+            echo "Checked for: alexfriend-src.zip, alexfriend-mod-1.12.2-src.zip, or any *.zip"
+            # Still continue in case source is already extracted / committed as folders
+          else
+            echo "Found ZIP: $ZIP"
+            rm -rf alexfriend-src extracted-src
+            mkdir -p extracted-src
+            unzip -o "$ZIP" -d extracted-src
+            echo "=== Contents after unzip ==="
+            find extracted-src -maxdepth 3 -type f | head -30
+          fi
+
+      - name: Locate project root (build.gradle)
         id: root
         run: |
-          if [ -d "alexfriend-src" ] && [ -f "alexfriend-src/build.gradle" ]; then
-            echo "dir=alexfriend-src" >> $GITHUB_OUTPUT
-          elif [ -f "build.gradle" ]; then
-            echo "dir=." >> $GITHUB_OUTPUT
-          elif [ -d "alexfriend-mod" ] && [ -f "alexfriend-mod/build.gradle" ]; then
-            echo "dir=alexfriend-mod" >> $GITHUB_OUTPUT
-          else
-            echo "Could not find build.gradle"
-            find . -name "build.gradle" | head -5
+          set -e
+          echo "=== Searching for build.gradle ==="
+
+          # Possible locations (in order of preference)
+          CANDIDATES=(
+            "extracted-src/alexfriend-mod"
+            "extracted-src"
+            "alexfriend-src"
+            "alexfriend-mod"
+            "."
+          )
+
+          FOUND=""
+          for dir in "${CANDIDATES[@]}"; do
+            if [ -f "$dir/build.gradle" ]; then
+              FOUND="$dir"
+              echo "Found build.gradle in: $FOUND"
+              break
+            fi
+          done
+
+          # Deep search as last resort
+          if [ -z "$FOUND" ]; then
+            echo "Trying deep search..."
+            FOUND=$(find . -name "build.gradle" -type f | head -1 | xargs dirname 2>/dev/null || true)
+            if [ -n "$FOUND" ]; then
+              echo "Deep search found: $FOUND"
+            fi
+          fi
+
+          if [ -z "$FOUND" ] || [ ! -f "$FOUND/build.gradle" ]; then
+            echo "ERROR: Could not find build.gradle"
+            echo "Current directory tree (depth 4):"
+            find . -maxdepth 4 \( -name "build.gradle" -o -type d \) | head -50
             exit 1
           fi
+
+          echo "dir=$FOUND" >> $GITHUB_OUTPUT
+          echo "Project root set to: $FOUND"
+          ls -la "$FOUND"
 
       - name: Cache Gradle packages
         uses: actions/cache@v4
@@ -62,39 +114,53 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-gradle-alexfriend-${{ hashFiles('**/build.gradle') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Grant execute permission for gradlew (if present)
+      - name: Grant execute permission for gradlew
         working-directory: ${{ steps.root.outputs.dir }}
         run: |
           if [ -f gradlew ]; then
             chmod +x gradlew
+            echo "gradlew is executable"
           else
-            echo "No gradlew found. Will attempt to use system gradle or generate wrapper later if needed."
+            echo "No gradlew present yet (will try to generate or use system)"
           fi
 
       - name: Setup Forge workspace and build
         working-directory: ${{ steps.root.outputs.dir }}
         run: |
-          # Classic FG 2.3 often needs the setup tasks. We try a pragmatic build path.
-          # First attempt direct build; if wrapper missing we fall back to a minimal approach.
-          if [ -f gradlew ]; then
-            ./gradlew --no-daemon setupDecompWorkspace build --stacktrace || ./gradlew --no-daemon build --stacktrace
-          else
-            # Fallback: install a compatible gradle and try
-            echo "Attempting build without wrapper (may require manual MDK for full decomp)"
-            # For pure source + build.gradle many CI setups still succeed with:
-            gradle wrapper --gradle-version 4.9 || true
-            if [ -f gradlew ]; then
-              chmod +x gradlew
-              ./gradlew --no-daemon build --stacktrace || true
+          set -e
+          echo "Working directory: $(pwd)"
+          ls -la
+
+          # Try to ensure a wrapper exists
+          if [ ! -f gradlew ]; then
+            echo "No gradlew found. Attempting to create one with Gradle 4.9..."
+            if command -v gradle >/dev/null 2>&1; then
+              gradle wrapper --gradle-version 4.9 || true
             fi
           fi
-          # Collect jars
+
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            echo "Running setupDecompWorkspace + build..."
+            ./gradlew --no-daemon setupDecompWorkspace --stacktrace || true
+            ./gradlew --no-daemon build --stacktrace
+          else
+            echo "ERROR: Still no gradlew. Cannot build with classic ForgeGradle 2.3 without wrapper."
+            echo "Please include a gradle wrapper in the source ZIP or start from an official Forge MDK."
+            exit 1
+          fi
+
+          echo "=== Looking for built JARs ==="
+          find . -path "*/build/libs/*.jar" -type f
+
+      - name: Collect artifacts
+        run: |
           mkdir -p $GITHUB_WORKSPACE/artifacts
-          find . -path "*/build/libs/*.jar" -exec cp {} $GITHUB_WORKSPACE/artifacts/ \; || true
+          find ${{ steps.root.outputs.dir }} -path "*/build/libs/*.jar" -exec cp -v {} $GITHUB_WORKSPACE/artifacts/ \; || true
           ls -la $GITHUB_WORKSPACE/artifacts || true
 
       - name: Upload mod JAR
@@ -107,5 +173,5 @@ jobs:
       - name: Summary
         run: |
           echo "### Alex Friend Build" >> $GITHUB_STEP_SUMMARY
-          echo "Build completed for Forge 1.12.2." >> $GITHUB_STEP_SUMMARY
-          echo "Check the uploaded artifact for the JAR." >> $GITHUB_STEP_SUMMARY
+          echo "Project root used: \`${{ steps.root.outputs.dir }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Check the uploaded artifact for the JAR (if build succeeded)." >> $GITHUB_STEP_SUMMARY
